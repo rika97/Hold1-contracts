@@ -1,102 +1,177 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-contract Hold1 {
+contract TrainGame {
     address public owner;
-    uint256 public constant NEW_USER_TOKENS = 1000 * 1e18;
-    uint256 public constant FRIEND_BONUS_TOKENS = 500 * 1e18;
-    uint256 public constant TASK_BONUS_TOKENS = 200 * 1e18;
-    uint256 public constant PRICE_TARGET_PERCENTAGE = 10;
-    uint256 public constant TIME_LIMIT = 30 minutes;
+    uint256 public trainCounter;
+    uint256 public dailyJackpot;
+    uint256 public lastResetTime;
 
-    struct Train {
-        address[] users;
-        uint256 startTime;
-        uint256 startPrice;
-        uint256 totalTokens;
+    struct User {
+        address[] friends;
+        bool registered;
     }
 
-    mapping(address => uint256) public balances;
-    mapping(uint256 => Train) public trains;
-    uint256 public nextTrainId;
-    uint256 public jackpot;
+    struct Train {
+        uint256 id;
+        address[] participants;
+        uint256 jackpotContribution;
+        uint256 startTime;
+        uint256 lastDepositTime;
+        bool isActive;
+    }
 
-    event TrainStarted(uint256 trainId, address starter);
-    event TrainJoined(uint256 trainId, address user);
-    event TrainWon(uint256 trainId, address winner, uint256 amount);
+    mapping(address => User) public users;
+    mapping(uint256 => Train) public trains;
+
+    event UserRegistered(address user);
+    event FriendAdded(address user, address friend);
+    event TrainStarted(uint256 trainId, address initiator);
+    event TrainCompleted(uint256 trainId, bool success);
+    event DailyJackpotDistributed(uint256 timestamp, uint256 distributedAmount);
+    event DailyJackpotReset(uint256 timestamp, uint256 remainingJackpot);
 
     constructor() {
         owner = msg.sender;
+        lastResetTime = block.timestamp;
     }
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can call this function");
-        _;
+    // User Registration Logic
+    function registerUser() external {
+        require(!users[msg.sender].registered, "Already registered");
+        users[msg.sender].registered = true;
+        // Grant 1000 ONEs by transferring from the contract's balance
+        require(address(this).balance >= 1000 ether, "Contract doesn't have enough balance");
+        payable(msg.sender).transfer(1000 ether);
+        emit UserRegistered(msg.sender);
     }
 
-    function registerUser(address newUser) external onlyOwner {
-        require(balances[newUser] == 0, "User already registered");
-        balances[newUser] = NEW_USER_TOKENS;
+    // Friend Addition Logic
+    function addFriend(address friend) external {
+        require(users[msg.sender].registered, "Register first");
+        require(users[friend].registered, "Friend must be registered");
+        require(!isFriend(msg.sender, friend), "Already friends");
+
+        users[msg.sender].friends.push(friend);
+        users[friend].friends.push(msg.sender);
+
+        // Grant 500 ONEs to both users by transferring from the contract's balance
+        require(address(this).balance >= 1000 ether, "Contract doesn't have enough balance");
+        payable(msg.sender).transfer(500 ether);
+        payable(friend).transfer(500 ether);
+
+        emit FriendAdded(msg.sender, friend);
     }
 
-    function addFriend(address user, address friend) external onlyOwner {
-        require(balances[user] > 0, "User not registered");
-        require(balances[friend] > 0, "Friend not registered");
-        balances[user] += FRIEND_BONUS_TOKENS;
-        balances[friend] += FRIEND_BONUS_TOKENS;
+    function isFriend(address user, address friend) internal view returns (bool) {
+        for (uint i = 0; i < users[user].friends.length; i++) {
+            if (users[user].friends[i] == friend) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    function completeTask(address user) external onlyOwner {
-        require(balances[user] > 0, "User not registered");
-        balances[user] += TASK_BONUS_TOKENS;
+    // Train Start Logic
+    function startTrain() external payable {
+        require(users[msg.sender].registered, "Register first");
+        require(msg.value > 0, "Must deposit some ONEs to start the train");
+
+        resetDailyJackpotIfNeeded();
+
+        trainCounter++;
+        trains[trainCounter] = Train({
+            id: trainCounter,
+            participants: new address [],
+            jackpotContribution: msg.value,
+            startTime: block.timestamp,
+            lastDepositTime: block.timestamp,
+            isActive: true
+        });
+
+        trains[trainCounter].participants.push(msg.sender);
+        dailyJackpot += msg.value;
+
+        emit TrainStarted(trainCounter, msg.sender);
     }
 
-    function startTrain() external {
-        require(balances[msg.sender] > 0, "User not registered");
-        Train storage train = trains[nextTrainId++];
-        train.users.push(msg.sender);
-        train.startTime = block.timestamp;
-        train.startPrice = getCurrentPrice();
-        train.totalTokens += balances[msg.sender];
-        balances[msg.sender] = 0;
+    // Deposit to Train
+    function depositToTrain(uint256 trainId) external payable {
+        require(users[msg.sender].registered, "Register first");
+        require(trains[trainId].isActive, "Train is not active");
+        require(msg.value > 0, "Must deposit some ONEs");
 
-        emit TrainStarted(nextTrainId - 1, msg.sender);
-    }
+        resetDailyJackpotIfNeeded();
 
-    function joinTrain(uint256 trainId) external {
-        require(balances[msg.sender] > 0, "User not registered");
-        Train storage train = trains[trainId];
-        require(block.timestamp < train.startTime + TIME_LIMIT, "Time limit exceeded");
-        train.users.push(msg.sender);
-        train.totalTokens += balances[msg.sender];
-        balances[msg.sender] = 0;
+        trains[trainId].jackpotContribution += msg.value;
+        dailyJackpot += msg.value;
+        trains[trainId].lastDepositTime = block.timestamp; // Update last deposit time
 
-        emit TrainJoined(trainId, msg.sender);
-    }
+        trains[trainId].participants.push(msg.sender);
 
-    function checkTrain(uint256 trainId) external {
-        Train storage train = trains[trainId];
-        require(block.timestamp >= train.startTime + TIME_LIMIT, "Time limit not exceeded");
-        uint256 currentPrice = getCurrentPrice();
-        if (currentPrice >= train.startPrice + (train.startPrice * PRICE_TARGET_PERCENTAGE / 100)) {
-            // Train won
-            address winner = train.users[random() % train.users.length];
-            uint256 reward = train.totalTokens / 2;
-            balances[winner] += reward;
-            balances[owner] += train.totalTokens - reward;
-            emit TrainWon(trainId, winner, reward);
-        } else {
-            // Train lost
-            jackpot += train.totalTokens;
+        // Check if the train should remain active
+        if (block.timestamp - trains[trainId].lastDepositTime > 30 minutes) {
+            trains[trainId].isActive = false;
         }
     }
 
-    function random() private view returns (uint256) {
-        return uint256(keccak256(abi.encodePacked(block.difficulty, block.timestamp, nextTrainId)));
+    // Check Train Status
+    function checkTrainStatus(uint256 trainId, uint256 currentONEPrice, uint256 previousONEPrice) external {
+        require(trains[trainId].isActive, "Train is not active");
+
+        bool isSuccess = false;
+        uint256 timeElapsed = block.timestamp - trains[trainId].startTime;
+
+        if (timeElapsed >= 1 days || currentONEPrice >= previousONEPrice * 110 / 100) {
+            isSuccess = true;
+        }
+
+        trains[trainId].isActive = false;
+        emit TrainCompleted(trainId, isSuccess);
     }
 
-    function getCurrentPrice() private view returns (uint256) {
-        // Implement actual price fetching logic here
-        return 100; // Placeholder
+    // Distribute Jackpot Automatically
+    function distributeJackpot() external {
+        require(block.timestamp >= lastResetTime + 1 days, "It's not time to distribute the jackpot yet");
+
+        uint256 distributedAmount = dailyJackpot * 50 / 100;
+        uint256 remainingJackpot = dailyJackpot - distributedAmount;
+
+        // Distribute 50% of the daily jackpot to random users of winning trains
+        for (uint256 i = 1; i <= trainCounter; i++) {
+            if (trains[i].isActive) {
+                distributeJackpotForTrain(i, distributedAmount);
+            }
+        }
+
+        dailyJackpot = remainingJackpot;
+        lastResetTime = block.timestamp;
+
+        emit DailyJackpotDistributed(block.timestamp, distributedAmount);
+        emit DailyJackpotReset(block.timestamp, remainingJackpot);
     }
+
+    function distributeJackpotForTrain(uint256 trainId, uint256 distributedAmount) internal {
+        uint256 totalParticipants = trains[trainId].participants.length;
+        if (totalParticipants == 0) return;
+
+        uint256 reward = distributedAmount / totalParticipants;
+
+        for (uint256 i = 0; i < totalParticipants; i++) {
+            payable(trains[trainId].participants[i]).transfer(reward);
+        }
+    }
+
+    // Reset Daily Jackpot
+    function resetDailyJackpotIfNeeded() internal {
+        if (block.timestamp >= lastResetTime + 1 days) {
+            emit DailyJackpotReset(block.timestamp, dailyJackpot);
+
+            dailyJackpot = 0;
+            lastResetTime = block.timestamp;
+        }
+    }
+
+    // Fallback function to accept incoming ether
+    receive() external payable {}
 }
